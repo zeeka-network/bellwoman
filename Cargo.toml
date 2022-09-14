@@ -29,6 +29,11 @@ log = { version = "0.4", optional = true }
 num_cpus = { version = "1", optional = true }
 rayon = { version = "1.5.1", optional = true }
 
+# GPU dependencies
+ocl = "0.19"
+thiserror = "1.0"
+bls12_381 = "0.7"
+
 [dev-dependencies]
 bls12_381 = "0.7"
 criterion = "0.3"

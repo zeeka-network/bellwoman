@@ -551,6 +551,7 @@ mod test_with_bls12_381 {
                 },
                 &params,
                 &mut rng,
+                Backend::Cpu,
             )
             .unwrap();
 

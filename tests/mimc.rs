@@ -13,8 +13,10 @@ use bls12_381::{Bls12, Scalar};
 // We're going to use the Groth16 proving system.
 use bellman::groth16::{
     batch, create_random_proof, generate_random_parameters, prepare_verifying_key, verify_proof,
-    Proof,
+    Backend, Proof,
 };
+
+use bellman::gpu::{Brand, Device, OptParams};
 
 mod common;
 
@@ -49,6 +51,8 @@ fn test_mimc() {
 
     println!("Creating proofs...");
 
+    let devs = Device::by_brand(Brand::Nvidia).unwrap();
+
     // Let's benchmark stuff!
     const SAMPLES: u32 = 50;
     let mut total_proving = Duration::new(0, 0);
@@ -77,7 +81,13 @@ fn test_mimc() {
             };
 
             // Create a groth16 proof with our parameters.
-            let proof = create_random_proof(c, &params, &mut rng).unwrap();
+            let proof = create_random_proof(
+                c,
+                &params,
+                &mut rng,
+                Backend::Gpu(vec![(devs[0].clone(), OptParams::default())]),
+            )
+            .unwrap();
 
             proof.write(&mut proof_vec).unwrap();
         }
@@ -159,7 +169,7 @@ fn batch_verify() {
             };
 
             // Create a groth16 proof with our parameters.
-            let proof = create_random_proof(c, &params, &mut rng).unwrap();
+            let proof = create_random_proof(c, &params, &mut rng, Backend::Cpu).unwrap();
 
             proof.write(&mut proof_vec).unwrap();
         }
