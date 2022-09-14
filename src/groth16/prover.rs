@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use ff::{Field, PrimeField, PrimeFieldBits};
 use group::{prime::PrimeCurveAffine, Curve};
+use log::info;
 use pairing::Engine;
+use rayon::prelude::*;
 
 use super::{ParameterSource, Proof};
 
@@ -12,7 +14,7 @@ use crate::{Circuit, ConstraintSystem, Index, LinearCombination, SynthesisError,
 
 use crate::domain::{EvaluationDomain, Scalar};
 
-use crate::multiexp::{multiexp, DensityTracker, FullDensity};
+use crate::multiexp::{multiexp, multiexp_gpu, DensityTracker, FullDensity};
 
 use crate::multicore::Worker;
 
@@ -161,9 +163,10 @@ pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
     circuit: C,
     params: P,
     mut rng: &mut R,
+    backend: Backend,
 ) -> Result<Proof<E>, SynthesisError>
 where
-    E: Engine,
+    E: Engine + crate::gpu::GpuEngine,
     E::Fr: PrimeFieldBits,
     C: Circuit<E::Fr>,
     R: RngCore,
@@ -171,7 +174,13 @@ where
     let r = E::Fr::random(&mut rng);
     let s = E::Fr::random(&mut rng);
 
-    create_proof::<E, C, P>(circuit, params, r, s)
+    create_proof::<E, C, P>(circuit, params, r, s, backend)
+}
+
+#[derive(Clone)]
+pub enum Backend {
+    Cpu,
+    Gpu(Vec<(crate::gpu::Device, crate::gpu::OptParams)>),
 }
 
 #[allow(clippy::many_single_char_names)]
@@ -180,9 +189,10 @@ pub fn create_proof<E, C, P: ParameterSource<E>>(
     mut params: P,
     r: E::Fr,
     s: E::Fr,
+    backend: Backend,
 ) -> Result<Proof<E>, SynthesisError>
 where
-    E: Engine,
+    E: Engine + crate::gpu::GpuEngine,
     E::Fr: PrimeFieldBits,
     C: Circuit<E::Fr>,
 {
@@ -199,7 +209,9 @@ where
 
     prover.alloc_input(|| "", || Ok(E::Fr::ONE))?;
 
+    info!("Synthesizing the circuit...");
     circuit.synthesize(&mut prover)?;
+    info!("Synthesize done!");
 
     for i in 0..prover.input_assignment.len() {
         prover.enforce(|| "", |lc| lc + Variable(Index::Input(i)), |lc| lc, |lc| lc);
@@ -209,104 +221,261 @@ where
 
     let vk = params.get_vk(prover.input_assignment.len())?;
 
-    let h = {
+    let h_scalars: Vec<_> = {
         let mut a = EvaluationDomain::from_coeffs(prover.a)?;
         let mut b = EvaluationDomain::from_coeffs(prover.b)?;
         let mut c = EvaluationDomain::from_coeffs(prover.c)?;
-        a.ifft(&worker);
-        a.coset_fft(&worker);
-        b.ifft(&worker);
-        b.coset_fft(&worker);
-        c.ifft(&worker);
-        c.coset_fft(&worker);
+        match &backend {
+            Backend::Cpu => {
+                a.ifft(&worker);
+                a.coset_fft(&worker);
+                b.ifft(&worker);
+                b.coset_fft(&worker);
+                c.ifft(&worker);
+                c.coset_fft(&worker);
 
-        a.mul_assign(&worker, &b);
-        drop(b);
-        a.sub_assign(&worker, &c);
-        drop(c);
-        a.divide_by_z_on_coset(&worker);
-        a.icoset_fft(&worker);
-        let mut a = a.into_coeffs();
-        let a_len = a.len() - 1;
-        a.truncate(a_len);
-        // TODO: parallelize if it's even helpful
-        let a = Arc::new(a.into_iter().map(|s| s.0.into()).collect::<Vec<_>>());
+                a.mul_assign(&worker, &b);
+                drop(b);
+                a.sub_assign(&worker, &c);
+                drop(c);
+                a.divide_by_z_on_coset(&worker);
+                a.icoset_fft(&worker);
+                let mut a = a.into_coeffs();
+                let a_len = a.len() - 1;
+                a.truncate(a_len);
+                a
+            }
+            Backend::Gpu(devs) => {
+                let mut fft_kern = crate::gpu::FftKernel::<E>::create(devs, None).unwrap();
+                EvaluationDomain::<E::Fr, Scalar<E::Fr>>::many_gpu_ifft_coset_fft::<E>(
+                    &mut [&mut b, &mut c],
+                    &worker,
+                    &mut fft_kern,
+                )
+                .unwrap();
+                EvaluationDomain::<E::Fr, Scalar<E::Fr>>::gpu_ifft_coset_fft_mul_sub_divide_by_z_icoset_fft::<E>(
+                    &mut a,
+                    &b,
+                    &c,
+                    &mut fft_kern,
+                )
+                .unwrap();
+                let mut a = a.into_coeffs();
+                let a_len = a.len() - 1;
+                a.truncate(a_len);
+                a
+            }
+        }
+    }; // TODO: parallelize if it's even helpful
 
-        multiexp(&worker, params.get_h(a.len())?, FullDensity, a)
+    let (a_inputs, a_aux, b_g1_inputs, b_g1_aux, b_g2_inputs, b_g2_aux, h, l) = match &backend {
+        Backend::Cpu => {
+            let h_exps = h_scalars
+                .into_iter()
+                .map(|s| s.0.into())
+                .collect::<Vec<_>>();
+            let h = multiexp(
+                &worker,
+                params.get_h(h_exps.len())?,
+                FullDensity,
+                Arc::new(h_exps),
+            );
+
+            // TODO: parallelize if it's even helpful
+            let input_assignment = Arc::new(
+                prover
+                    .input_assignment
+                    .into_iter()
+                    .map(|s| s.into())
+                    .collect::<Vec<_>>(),
+            );
+            let aux_assignment = Arc::new(
+                prover
+                    .aux_assignment
+                    .into_iter()
+                    .map(|s| s.into())
+                    .collect::<Vec<_>>(),
+            );
+
+            let l = multiexp(
+                &worker,
+                params.get_l(aux_assignment.len())?,
+                FullDensity,
+                aux_assignment.clone(),
+            );
+
+            let a_aux_density_total = prover.a_aux_density.get_total_density();
+
+            let (a_inputs_source, a_aux_source) =
+                params.get_a(input_assignment.len(), a_aux_density_total)?;
+
+            let a_inputs = multiexp(
+                &worker,
+                a_inputs_source,
+                FullDensity,
+                input_assignment.clone(),
+            );
+            let a_aux = multiexp(
+                &worker,
+                a_aux_source,
+                Arc::new(prover.a_aux_density),
+                aux_assignment.clone(),
+            );
+
+            let b_input_density = Arc::new(prover.b_input_density);
+            let b_input_density_total = b_input_density.get_total_density();
+            let b_aux_density = Arc::new(prover.b_aux_density);
+            let b_aux_density_total = b_aux_density.get_total_density();
+
+            let (b_g1_inputs_source, b_g1_aux_source) =
+                params.get_b_g1(b_input_density_total, b_aux_density_total)?;
+
+            let b_g1_inputs = multiexp(
+                &worker,
+                b_g1_inputs_source,
+                b_input_density.clone(),
+                input_assignment.clone(),
+            );
+            let b_g1_aux = multiexp(
+                &worker,
+                b_g1_aux_source,
+                b_aux_density.clone(),
+                aux_assignment.clone(),
+            );
+
+            let (b_g2_inputs_source, b_g2_aux_source) =
+                params.get_b_g2(b_input_density_total, b_aux_density_total)?;
+
+            let b_g2_inputs = multiexp(
+                &worker,
+                b_g2_inputs_source,
+                b_input_density,
+                input_assignment,
+            );
+            let b_g2_aux = multiexp(&worker, b_g2_aux_source, b_aux_density, aux_assignment);
+
+            (
+                a_inputs,
+                a_aux,
+                b_g1_inputs,
+                b_g1_aux,
+                b_g2_inputs,
+                b_g2_aux,
+                h,
+                l,
+            )
+        }
+        Backend::Gpu(devs) => {
+            let mut mx_kern = crate::gpu::MultiexpKernel::<E>::create(devs, None).unwrap();
+            let h_exps = h_scalars
+                .into_par_iter()
+                .map(|s| s.0.to_repr())
+                .collect::<Vec<_>>();
+            let h = multiexp_gpu::<_, _, E::G1, _, E>(
+                &worker,
+                params.get_h(h_exps.len())?,
+                FullDensity,
+                Arc::new(h_exps),
+                &mut mx_kern,
+            );
+
+            // TODO: parallelize if it's even helpful
+            let input_assignment = Arc::new(
+                prover
+                    .input_assignment
+                    .into_par_iter()
+                    .map(|s| s.to_repr())
+                    .collect::<Vec<_>>(),
+            );
+            let aux_assignment = Arc::new(
+                prover
+                    .aux_assignment
+                    .into_par_iter()
+                    .map(|s| s.to_repr())
+                    .collect::<Vec<_>>(),
+            );
+
+            let l = multiexp_gpu::<_, _, E::G1, _, E>(
+                &worker,
+                params.get_l(aux_assignment.len())?,
+                FullDensity,
+                aux_assignment.clone(),
+                &mut mx_kern,
+            );
+
+            let a_aux_density_total = prover.a_aux_density.get_total_density();
+
+            let (a_inputs_source, a_aux_source) =
+                params.get_a(input_assignment.len(), a_aux_density_total)?;
+
+            let a_inputs = multiexp_gpu::<_, _, E::G1, _, E>(
+                &worker,
+                a_inputs_source,
+                FullDensity,
+                input_assignment.clone(),
+                &mut mx_kern,
+            );
+            let a_aux = multiexp_gpu::<_, _, E::G1, _, E>(
+                &worker,
+                a_aux_source,
+                Arc::new(prover.a_aux_density),
+                aux_assignment.clone(),
+                &mut mx_kern,
+            );
+
+            let b_input_density = Arc::new(prover.b_input_density);
+            let b_input_density_total = b_input_density.get_total_density();
+            let b_aux_density = Arc::new(prover.b_aux_density);
+            let b_aux_density_total = b_aux_density.get_total_density();
+
+            let (b_g1_inputs_source, b_g1_aux_source) =
+                params.get_b_g1(b_input_density_total, b_aux_density_total)?;
+
+            let b_g1_inputs = multiexp_gpu::<_, _, E::G1, _, E>(
+                &worker,
+                b_g1_inputs_source,
+                b_input_density.clone(),
+                input_assignment.clone(),
+                &mut mx_kern,
+            );
+            let b_g1_aux = multiexp_gpu::<_, _, E::G1, _, E>(
+                &worker,
+                b_g1_aux_source,
+                b_aux_density.clone(),
+                aux_assignment.clone(),
+                &mut mx_kern,
+            );
+
+            let (b_g2_inputs_source, b_g2_aux_source) =
+                params.get_b_g2(b_input_density_total, b_aux_density_total)?;
+
+            let b_g2_inputs = multiexp_gpu::<_, _, E::G2, _, E>(
+                &worker,
+                b_g2_inputs_source,
+                b_input_density,
+                input_assignment,
+                &mut mx_kern,
+            );
+            let b_g2_aux = multiexp_gpu::<_, _, E::G2, _, E>(
+                &worker,
+                b_g2_aux_source,
+                b_aux_density,
+                aux_assignment,
+                &mut mx_kern,
+            );
+
+            (
+                a_inputs,
+                a_aux,
+                b_g1_inputs,
+                b_g1_aux,
+                b_g2_inputs,
+                b_g2_aux,
+                h,
+                l,
+            )
+        }
     };
-
-    // TODO: parallelize if it's even helpful
-    let input_assignment = Arc::new(
-        prover
-            .input_assignment
-            .into_iter()
-            .map(|s| s.into())
-            .collect::<Vec<_>>(),
-    );
-    let aux_assignment = Arc::new(
-        prover
-            .aux_assignment
-            .into_iter()
-            .map(|s| s.into())
-            .collect::<Vec<_>>(),
-    );
-
-    let l = multiexp(
-        &worker,
-        params.get_l(aux_assignment.len())?,
-        FullDensity,
-        aux_assignment.clone(),
-    );
-
-    let a_aux_density_total = prover.a_aux_density.get_total_density();
-
-    let (a_inputs_source, a_aux_source) =
-        params.get_a(input_assignment.len(), a_aux_density_total)?;
-
-    let a_inputs = multiexp(
-        &worker,
-        a_inputs_source,
-        FullDensity,
-        input_assignment.clone(),
-    );
-    let a_aux = multiexp(
-        &worker,
-        a_aux_source,
-        Arc::new(prover.a_aux_density),
-        aux_assignment.clone(),
-    );
-
-    let b_input_density = Arc::new(prover.b_input_density);
-    let b_input_density_total = b_input_density.get_total_density();
-    let b_aux_density = Arc::new(prover.b_aux_density);
-    let b_aux_density_total = b_aux_density.get_total_density();
-
-    let (b_g1_inputs_source, b_g1_aux_source) =
-        params.get_b_g1(b_input_density_total, b_aux_density_total)?;
-
-    let b_g1_inputs = multiexp(
-        &worker,
-        b_g1_inputs_source,
-        b_input_density.clone(),
-        input_assignment.clone(),
-    );
-    let b_g1_aux = multiexp(
-        &worker,
-        b_g1_aux_source,
-        b_aux_density.clone(),
-        aux_assignment.clone(),
-    );
-
-    let (b_g2_inputs_source, b_g2_aux_source) =
-        params.get_b_g2(b_input_density_total, b_aux_density_total)?;
-
-    let b_g2_inputs = multiexp(
-        &worker,
-        b_g2_inputs_source,
-        b_input_density,
-        input_assignment,
-    );
-    let b_g2_aux = multiexp(&worker, b_g2_aux_source, b_aux_density, aux_assignment);
 
     if bool::from(vk.delta_g1.is_identity() | vk.delta_g2.is_identity()) {
         // If this element is zero, someone is trying to perform a

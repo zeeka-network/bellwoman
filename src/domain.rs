@@ -11,8 +11,9 @@
 //! [`EvaluationDomain`]: crate::domain::EvaluationDomain
 //! [Groth16]: https://eprint.iacr.org/2016/260
 
-use ff::PrimeField;
+use ff::{Field, PrimeField};
 use group::cofactor::CofactorCurve;
+use pairing::Engine;
 
 use super::SynthesisError;
 
@@ -186,6 +187,57 @@ impl<S: PrimeField, G: Group<S>> EvaluationDomain<S, G> {
                 });
             }
         });
+    }
+
+    pub fn many_gpu_ifft_coset_fft<E: Engine + crate::gpu::GpuEngine>(
+        a: &mut [&mut EvaluationDomain<E::Fr, Scalar<E::Fr>>],
+        worker: &Worker,
+        kern: &mut crate::gpu::FftKernel<E>,
+    ) -> crate::gpu::GpuResult<()> {
+        kern.many_ifft_coset_fft(
+            worker,
+            a.iter_mut()
+                .map(|a| {
+                    (
+                        unsafe {
+                            std::mem::transmute::<&mut [Scalar<E::Fr>], &mut [E::Fr]>(&mut a.coeffs)
+                        },
+                        a.exp,
+                        a.omega,
+                        a.omegainv,
+                        a.minv,
+                    )
+                })
+                .collect(),
+        )?;
+        Ok(())
+    }
+
+    pub fn gpu_ifft_coset_fft_mul_sub_divide_by_z_icoset_fft<E: Engine + crate::gpu::GpuEngine>(
+        a: &mut EvaluationDomain<E::Fr, Scalar<E::Fr>>,
+        b: &EvaluationDomain<E::Fr, Scalar<E::Fr>>,
+        c: &EvaluationDomain<E::Fr, Scalar<E::Fr>>,
+        kern: &mut crate::gpu::FftKernel<E>,
+    ) -> crate::gpu::GpuResult<()> {
+        use std::mem::transmute;
+        let divz = a.z(&E::Fr::multiplicative_generator()).invert().unwrap();
+
+        let a_coeffs = unsafe { transmute::<&mut [Scalar<E::Fr>], &mut [E::Fr]>(&mut a.coeffs) };
+        let b_coeffs = unsafe { transmute::<&[Scalar<E::Fr>], &[E::Fr]>(&b.coeffs) };
+        let c_coeffs = unsafe { transmute::<&[Scalar<E::Fr>], &[E::Fr]>(&c.coeffs) };
+
+        kern.ifft_coset_fft_mul_sub_divide_by_z_icoset_fft(
+            a_coeffs,
+            b_coeffs,
+            c_coeffs,
+            a.exp,
+            &a.omega,
+            &a.omegainv,
+            &a.minv,
+            &a.geninv,
+            &divz,
+        )?;
+        Ok(())
     }
 }
 
@@ -495,4 +547,87 @@ fn parallel_fft_consistency() {
     let rng = &mut rand::thread_rng();
 
     test_consistency::<Fr, _>(rng);
+}
+
+#[test]
+fn gpu_eval_domain_consistency() {
+    use std::mem::transmute;
+
+    #[allow(dead_code)]
+    fn unmont(v: &mut EvaluationDomain<Fr, Scalar<Fr>>, worker: &Worker) {
+        worker.scope(v.coeffs.len(), |scope, chunk| {
+            for a in v.coeffs.chunks_mut(chunk) {
+                scope.spawn(move |_| {
+                    for v in a {
+                        unsafe {
+                            *v = transmute::<<Fr as PrimeField>::Repr, Scalar<Fr>>(
+                                transmute::<Scalar<Fr>, Fr>(v.clone()).to_repr(),
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    use bls12_381::{Bls12, Scalar as Fr};
+    use ff::Field;
+    let mut rng = rand::thread_rng();
+
+    let worker = Worker::new();
+
+    let log_d = 20;
+    let d = 1 << log_d;
+
+    let dev = crate::gpu::Device::by_brand(crate::gpu::Brand::Nvidia).unwrap()[0].clone();
+    let mut kern =
+        crate::gpu::FftKernel::<Bls12>::create(&[(dev, crate::gpu::OptParams::default())], None)
+            .unwrap();
+
+    let a = (0..d)
+        .map(|_| Scalar(Fr::random(&mut rng)))
+        .collect::<Vec<_>>();
+    let b = (0..d)
+        .map(|_| Scalar(Fr::random(&mut rng)))
+        .collect::<Vec<_>>();
+    let c = (0..d)
+        .map(|_| Scalar(Fr::random(&mut rng)))
+        .collect::<Vec<_>>();
+
+    let mut a_cpu = EvaluationDomain::<Fr, Scalar<Fr>>::from_coeffs(a.clone()).unwrap();
+    let mut b_cpu = EvaluationDomain::<Fr, Scalar<Fr>>::from_coeffs(b.clone()).unwrap();
+    let mut c_cpu = EvaluationDomain::<Fr, Scalar<Fr>>::from_coeffs(c.clone()).unwrap();
+
+    let mut a_gpu = EvaluationDomain::<Fr, Scalar<Fr>>::from_coeffs(a.clone()).unwrap();
+    let mut b_gpu = EvaluationDomain::<Fr, Scalar<Fr>>::from_coeffs(b.clone()).unwrap();
+    let mut c_gpu = EvaluationDomain::<Fr, Scalar<Fr>>::from_coeffs(c.clone()).unwrap();
+
+    println!("CPU");
+    a_cpu.ifft(&worker);
+    a_cpu.coset_fft(&worker);
+    b_cpu.ifft(&worker);
+    b_cpu.coset_fft(&worker);
+    c_cpu.ifft(&worker);
+    c_cpu.coset_fft(&worker);
+    a_cpu.mul_assign(&worker, &b_cpu);
+    a_cpu.sub_assign(&worker, &c_cpu);
+    a_cpu.divide_by_z_on_coset(&worker);
+    a_cpu.icoset_fft(&worker);
+    //unmont(&mut a_cpu, &worker);
+    println!("CPU");
+
+    println!("GPU");
+    EvaluationDomain::<Fr, Scalar<Fr>>::many_gpu_ifft_coset_fft::<Bls12>(
+        &mut [&mut b_gpu, &mut c_gpu],
+        &worker,
+        &mut kern,
+    )
+    .unwrap();
+    EvaluationDomain::<Fr, Scalar<Fr>>::gpu_ifft_coset_fft_mul_sub_divide_by_z_icoset_fft::<Bls12>(
+        &mut a_gpu, &b_gpu, &c_gpu, &mut kern,
+    )
+    .unwrap();
+    println!("GPU");
+
+    assert!(a_cpu.coeffs == a_gpu.coeffs);
 }

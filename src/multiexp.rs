@@ -20,6 +20,7 @@ pub trait SourceBuilder<G: PrimeCurveAffine>: Send + Sync + 'static + Clone {
     type Source: Source<G>;
 
     fn build(self) -> Self::Source;
+    fn get(&self) -> (&Arc<Vec<G>>, usize);
 }
 
 /// A source of bases, like an iterator.
@@ -47,6 +48,10 @@ impl<G: PrimeCurveAffine> SourceBuilder<G> for (Arc<Vec<G>>, usize) {
 
     fn build(self) -> (Arc<Vec<G>>, usize) {
         (self.0.clone(), self.1)
+    }
+
+    fn get(&self) -> (&Arc<Vec<G>>, usize) {
+        (&self.0, self.1)
     }
 }
 
@@ -167,6 +172,29 @@ pub enum Exponent<F: PrimeFieldBits> {
     Zero,
     One,
     Bits(FieldBits<F::ReprBits>),
+}
+
+impl<F: PrimeFieldBits> Exponent<F> {
+    pub fn to_repr<P: PrimeField>(&self) -> P::Repr {
+        match self {
+            Exponent::Zero => P::zero().to_repr(),
+            Exponent::One => P::one().to_repr(),
+            Exponent::Bits(bits) => {
+                let mut rep = P::Repr::default();
+                let mut i = 0;
+                for byte in bits.chunks(8) {
+                    let mut val = 0u8;
+                    for b in byte.iter().rev() {
+                        val = val << 1;
+                        val += if *b { 1 } else { 0 };
+                    }
+                    rep.as_mut()[i] = val;
+                    i += 1;
+                }
+                rep
+            }
+        }
+    }
 }
 
 impl<F: PrimeFieldBits> From<&F> for Exponent<F> {
@@ -299,7 +327,72 @@ where
             part.map(|part| (0..c).fold(acc, |acc, _| acc.double()) + part)
         })
 }
+pub fn multiexp_gpu<Q, D, G, S, E>(
+    pool: &Worker,
+    bases: S,
+    density_map: D,
+    exponents: Arc<Vec<<G::Scalar as PrimeField>::Repr>>,
+    kern: &mut crate::gpu::MultiexpKernel<E>,
+) -> Waiter<Result<G, SynthesisError>>
+where
+    for<'a> &'a Q: QueryDensity,
+    D: Send + Sync + 'static + Clone + AsRef<Q>,
+    G: PrimeCurve,
+    G::Scalar: PrimeFieldBits,
+    S: SourceBuilder<<G as PrimeCurve>::Affine>,
+    E: pairing::Engine + crate::gpu::GpuEngine,
+    E::Fr: PrimeFieldBits,
+{
+    const GPU_MINIMUM: usize = 1024;
+    let query_size = density_map.as_ref().get_query_size();
+    if exponents.len() >= GPU_MINIMUM
+        && (query_size.is_none() || query_size.unwrap() >= GPU_MINIMUM)
+    {
+        let is_full = query_size.is_none();
+        let (bss, skip) = bases.get();
+        if is_full {
+            return Waiter::done(
+                kern.multiexp(pool, &bss, &exponents, skip)
+                    .map_err(Into::into),
+            );
+        } else {
+            let query_size = density_map.as_ref().get_query_size().unwrap();
+            let mut exps = Vec::<<G::Scalar as PrimeField>::Repr>::with_capacity(query_size);
+            let exps_ptr = exps.as_mut_ptr();
+            let mut n = 0;
+            for (e, d) in exponents.iter().zip(density_map.as_ref().iter()) {
+                if d {
+                    unsafe {
+                        *exps_ptr.add(n) = *e;
+                    }
+                    n += 1;
+                }
+            }
+            unsafe {
+                exps.set_len(n);
+            }
 
+            if n >= GPU_MINIMUM {
+                return Waiter::done(
+                    kern.multiexp::<<G as PrimeCurve>::Affine>(pool, &bss, &exps, skip)
+                        .map_err(Into::into),
+                );
+            }
+        }
+    }
+
+    multiexp(
+        pool,
+        bases,
+        density_map,
+        Arc::new(
+            exponents
+                .iter()
+                .map(|e| Exponent::from(G::Scalar::from_repr(*e).unwrap()))
+                .collect(),
+        ),
+    )
+}
 /// Perform multi-exponentiation. The caller is responsible for ensuring the
 /// query size is the same as the number of exponents.
 pub fn multiexp<Q, D, G, S>(
@@ -372,7 +465,85 @@ fn test_with_bls12() {
     let naive: <Bls12 as Engine>::G1 = naive_multiexp(g.clone(), v);
 
     let pool = Worker::new();
-    let fast = multiexp(&pool, (g, 0), FullDensity, v_bits).wait().unwrap();
+    let fast = multiexp::<_, _, _, _>(&pool, (g, 0), FullDensity, v_bits)
+        .wait()
+        .unwrap();
 
     assert_eq!(naive, fast);
+}
+
+#[test]
+fn gpu_multiexp_consistency() {
+    use crate::gpu::*;
+    use bls12_381::{Bls12, Scalar};
+    use ff::Field;
+    use group::{Curve, Group};
+    use pairing::Engine;
+    use std::time::Instant;
+    const MAX_LOG_D: usize = 24;
+    const START_LOG_D: usize = 10;
+    let devices = Device::by_brand(Brand::Nvidia)
+        .unwrap()
+        .into_iter()
+        .map(|d| (d, OptParams::default()))
+        .collect::<Vec<_>>();
+    let mut kern =
+        MultiexpKernel::<Bls12>::create(&devices, None).expect("Cannot initialize kernel!");
+    let pool = Worker::new();
+
+    let mut rng = rand::thread_rng();
+
+    let mut bases = (0..(1 << 10))
+        .map(|_| <Bls12 as Engine>::G1::random(&mut rng).to_affine())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .cycle()
+        .take(1 << START_LOG_D)
+        .collect::<Vec<_>>();
+
+    for log_d in START_LOG_D..=MAX_LOG_D {
+        let g = Arc::new(bases.clone());
+
+        let samples = 1 << log_d;
+        println!("Testing Multiexp for {} elements...", samples);
+
+        let v_field = (0..samples)
+            .map(|_| <Bls12 as Engine>::Fr::random(&mut rng))
+            .collect::<Vec<_>>();
+        let v_repr = v_field.iter().map(|v| v.to_repr()).collect();
+        let v_exp = v_field.iter().map(|v| Exponent::from(v)).collect();
+
+        let mut now = Instant::now();
+        let gpu = multiexp_gpu::<_, _, <Bls12 as Engine>::G1, _, Bls12>(
+            &pool,
+            (g.clone(), 0),
+            FullDensity,
+            Arc::new(v_repr),
+            &mut kern,
+        )
+        .wait()
+        .unwrap();
+        let gpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
+        println!("GPU took {}ms.", gpu_dur);
+
+        now = Instant::now();
+        let cpu = multiexp::<_, _, <Bls12 as Engine>::G1, _>(
+            &pool,
+            (g.clone(), 0),
+            FullDensity,
+            Arc::new(v_exp),
+        )
+        .wait()
+        .unwrap();
+        let cpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
+        println!("CPU took {}ms.", cpu_dur);
+
+        println!("Speedup: x{}", cpu_dur as f32 / gpu_dur as f32);
+
+        assert_eq!(cpu, gpu);
+
+        println!("============================");
+
+        bases = [bases.clone(), bases.clone()].concat();
+    }
 }

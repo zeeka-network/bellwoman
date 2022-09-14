@@ -116,7 +116,7 @@
 //! };
 //!
 //! // Create a Groth16 proof with our parameters.
-//! let proof = groth16::create_random_proof(c, &params, &mut OsRng).unwrap();
+//! let proof = groth16::create_random_proof(c, &params, &mut OsRng, groth16::Backend::Cpu).unwrap();
 //!
 //! // Pack the hash as inputs for proof verification.
 //! let hash_bits = multipack::bytes_to_bits_le(&hash);
@@ -143,6 +143,8 @@ pub mod gadgets;
 pub mod groth16;
 pub mod multicore;
 pub mod multiexp;
+
+pub mod gpu;
 
 use ff::PrimeField;
 
@@ -319,11 +321,19 @@ pub enum SynthesisError {
     IoError(io::Error),
     /// During CRS generation, we observed an unconstrained auxiliary variable
     UnconstrainedVariable,
+    /// GPU Error
+    GpuError(crate::gpu::GpuError),
 }
 
 impl From<io::Error> for SynthesisError {
     fn from(e: io::Error) -> SynthesisError {
         SynthesisError::IoError(e)
+    }
+}
+
+impl From<crate::gpu::GpuError> for SynthesisError {
+    fn from(e: crate::gpu::GpuError) -> SynthesisError {
+        SynthesisError::GpuError(e)
     }
 }
 
@@ -341,9 +351,13 @@ impl fmt::Display for SynthesisError {
             SynthesisError::UnexpectedIdentity => "encountered an identity element in the CRS",
             SynthesisError::IoError(_) => "encountered an I/O error",
             SynthesisError::UnconstrainedVariable => "auxiliary variable was unconstrained",
+            SynthesisError::GpuError(_) => "encountered a GPU error",
         };
         if let SynthesisError::IoError(ref e) = *self {
             write!(f, "I/O error: ")?;
+            e.fmt(f)
+        } else if let SynthesisError::GpuError(ref e) = *self {
+            write!(f, "GPU error: ")?;
             e.fmt(f)
         } else {
             write!(f, "{}", msg)

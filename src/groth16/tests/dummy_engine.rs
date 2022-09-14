@@ -350,6 +350,26 @@ impl Engine for DummyEngine {
     }
 }
 
+pub struct NullField;
+impl crate::gpu::GpuField for NullField {
+    fn one() -> Vec<u32> {
+        panic!("Not implemented!");
+    }
+    fn modulus() -> Vec<u32> {
+        panic!("Not implemented!");
+    }
+    fn r2() -> Vec<u32> {
+        panic!("Not implemented!");
+    }
+    fn b3_coeff() -> Option<Vec<u32>> {
+        panic!("Not implemented!");
+    }
+}
+impl crate::gpu::GpuEngine for DummyEngine {
+    type Scalar = NullField;
+    type Fq = NullField;
+}
+
 impl MultiMillerLoop for DummyEngine {
     type G2Prepared = Fr;
     // TODO: This should be F_645131 or something. Doesn't matter for now.
