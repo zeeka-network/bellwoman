@@ -289,7 +289,7 @@ fn test_xordemo() {
             _marker: PhantomData,
         };
 
-        create_proof(c, &params, r, s, Backend::Cpu).unwrap()
+        create_proof(c, &params, r, s, Backend::Cpu, None).unwrap()
     };
 
     // A(x) =
@@ -432,7 +432,7 @@ fn zero_coeff_test(one_var: bool) {
         generate_parameters::<DummyEngine, _>(&m, g1, g2, alpha, beta, gamma, delta, tau).unwrap();
     let r = Fr::from(27134);
     let s = Fr::from(17146);
-    let pf = create_proof(&m, &pk, r, s, Backend::Cpu).unwrap();
+    let pf = create_proof(&m, &pk, r, s, Backend::Cpu, None).unwrap();
     let pvk = prepare_verifying_key(&pk.vk);
     verify_proof(&pvk, &pf, &[]).unwrap();
 }

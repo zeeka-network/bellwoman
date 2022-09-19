@@ -1,6 +1,6 @@
 use rand_core::RngCore;
 use std::ops::{AddAssign, MulAssign};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ff::{Field, PrimeField, PrimeFieldBits};
 use group::{prime::PrimeCurveAffine, Curve};
@@ -164,6 +164,7 @@ pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
     params: P,
     mut rng: &mut R,
     backend: Backend,
+    cancel: Option<Arc<RwLock<bool>>>,
 ) -> Result<Proof<E>, SynthesisError>
 where
     E: Engine + crate::gpu::GpuEngine,
@@ -174,7 +175,7 @@ where
     let r = E::Fr::random(&mut rng);
     let s = E::Fr::random(&mut rng);
 
-    create_proof::<E, C, P>(circuit, params, r, s, backend)
+    create_proof::<E, C, P>(circuit, params, r, s, backend, cancel)
 }
 
 #[derive(Clone)]
@@ -190,6 +191,7 @@ pub fn create_proof<E, C, P: ParameterSource<E>>(
     r: E::Fr,
     s: E::Fr,
     backend: Backend,
+    cancel: Option<Arc<RwLock<bool>>>,
 ) -> Result<Proof<E>, SynthesisError>
 where
     E: Engine + crate::gpu::GpuEngine,
@@ -246,7 +248,8 @@ where
                 a
             }
             Backend::Gpu(devs) => {
-                let mut fft_kern = crate::gpu::FftKernel::<E>::create(devs, None).unwrap();
+                let mut fft_kern =
+                    crate::gpu::FftKernel::<E>::create(devs, cancel.clone()).unwrap();
                 EvaluationDomain::<E::Fr, Scalar<E::Fr>>::many_gpu_ifft_coset_fft::<E>(
                     &mut [&mut b, &mut c],
                     &worker,
@@ -366,7 +369,8 @@ where
             )
         }
         Backend::Gpu(devs) => {
-            let mut mx_kern = crate::gpu::MultiexpKernel::<E>::create(devs, None).unwrap();
+            let mut mx_kern =
+                crate::gpu::MultiexpKernel::<E>::create(devs, cancel.clone()).unwrap();
             let h_exps = h_scalars
                 .into_par_iter()
                 .map(|s| s.0.to_repr())
