@@ -86,6 +86,7 @@ fn test_mimc() {
                 &params,
                 &mut rng,
                 Backend::Gpu(vec![(devs[0].clone(), OptParams::default())]),
+                None,
             )
             .unwrap();
 
@@ -169,7 +170,7 @@ fn batch_verify() {
             };
 
             // Create a groth16 proof with our parameters.
-            let proof = create_random_proof(c, &params, &mut rng, Backend::Cpu).unwrap();
+            let proof = create_random_proof(c, &params, &mut rng, Backend::Cpu, None).unwrap();
 
             proof.write(&mut proof_vec).unwrap();
         }

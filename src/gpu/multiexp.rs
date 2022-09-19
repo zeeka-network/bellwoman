@@ -4,7 +4,7 @@ use crate::multicore::Worker;
 use ff::PrimeField;
 use ff::PrimeFieldBits;
 use group::{prime::PrimeCurveAffine, Group};
-use log::{error, info};
+use log::info;
 use pairing::Engine;
 use std::any::TypeId;
 use std::ops::AddAssign;
