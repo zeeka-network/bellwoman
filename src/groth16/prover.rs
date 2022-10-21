@@ -254,15 +254,13 @@ where
                     &mut [&mut b, &mut c],
                     &worker,
                     &mut fft_kern,
-                )
-                .unwrap();
+                )?;
                 EvaluationDomain::<E::Fr, Scalar<E::Fr>>::gpu_ifft_coset_fft_mul_sub_divide_by_z_icoset_fft::<E>(
                     &mut a,
                     &b,
                     &c,
                     &mut fft_kern,
-                )
-                .unwrap();
+                )?;
                 let mut a = a.into_coeffs();
                 let a_len = a.len() - 1;
                 a.truncate(a_len);
