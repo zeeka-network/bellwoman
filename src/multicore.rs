@@ -98,13 +98,6 @@ mod implementation {
     impl<T> Waiter<T> {
         /// Consumes this waiter and blocks until the result is ready.
         pub fn wait(self) -> T {
-            // This will be Some if this thread is in the global thread pool.
-            if rayon::current_thread_index().is_some() {
-                let msg = "wait() cannot be called from within a thread pool since that would lead to deadlocks";
-                // panic! doesn't necessarily kill the process, so we log as well.
-                error!("{}", msg);
-                panic!("{}", msg);
-            }
             self.receiver.recv().unwrap()
         }
 
