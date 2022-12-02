@@ -1,6 +1,6 @@
 use rand_core::RngCore;
 use std::ops::{AddAssign, MulAssign};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ff::{Field, PrimeField, PrimeFieldBits};
 use group::{prime::PrimeCurveAffine, Curve};
@@ -181,7 +181,7 @@ where
 #[derive(Clone)]
 pub enum Backend {
     Cpu,
-    Gpu(Vec<(crate::gpu::Device, crate::gpu::OptParams)>),
+    Gpu(Arc<Mutex<Vec<(crate::gpu::Device, crate::gpu::OptParams)>>>),
 }
 
 #[allow(clippy::many_single_char_names)]
@@ -248,8 +248,9 @@ where
                 a
             }
             Backend::Gpu(devs) => {
+                let devs = devs.lock().unwrap();
                 let mut fft_kern =
-                    crate::gpu::FftKernel::<E>::create(devs, cancel.clone()).unwrap();
+                    crate::gpu::FftKernel::<E>::create(&devs, cancel.clone()).unwrap();
                 EvaluationDomain::<E::Fr, Scalar<E::Fr>>::many_gpu_ifft_coset_fft::<E>(
                     &mut [&mut b, &mut c],
                     &worker,
@@ -367,8 +368,9 @@ where
             )
         }
         Backend::Gpu(devs) => {
+            let devs = devs.lock().unwrap();
             let mut mx_kern =
-                crate::gpu::MultiexpKernel::<E>::create(devs, cancel.clone()).unwrap();
+                crate::gpu::MultiexpKernel::<E>::create(&devs, cancel.clone()).unwrap();
             let h_exps = h_scalars
                 .into_par_iter()
                 .map(|s| s.0.to_repr())

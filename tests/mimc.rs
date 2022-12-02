@@ -16,6 +16,8 @@ use bellman::groth16::{
     Backend, Proof,
 };
 
+use std::sync::{Arc, Mutex};
+
 use bellman::gpu::{Brand, Device, OptParams};
 
 mod common;
@@ -85,7 +87,10 @@ fn test_mimc() {
                 c,
                 &params,
                 &mut rng,
-                Backend::Gpu(vec![(devs[0].clone(), OptParams::default())]),
+                Backend::Gpu(Arc::new(Mutex::new(vec![(
+                    devs[0].clone(),
+                    OptParams::default(),
+                )]))),
                 None,
             )
             .unwrap();
