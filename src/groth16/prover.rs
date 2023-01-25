@@ -434,9 +434,8 @@ where
         // subversion-CRS attack.
         return Err(SynthesisError::UnexpectedIdentity);
     }
-
-    let mut g_a = vk.delta_g1 * r;
-    let mut g_b = vk.delta_g2 * s;
+    let mut g_a = E::G1::from(vk.alpha_g1);
+    let mut g_b = E::G2::from(vk.beta_g2);
     let mut g_c = E::G1::identity();
     let mut a_answer = a_inputs.wait()?;
     AddAssign::<&E::G1>::add_assign(&mut a_answer, &a_aux.wait()?);
