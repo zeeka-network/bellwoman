@@ -3,7 +3,7 @@ use std::ops::{AddAssign, MulAssign};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ff::{Field, PrimeField, PrimeFieldBits};
-use group::{prime::PrimeCurveAffine, Curve};
+use group::{prime::PrimeCurveAffine, Curve, Group};
 use log::info;
 use pairing::Engine;
 use rayon::prelude::*;
@@ -270,7 +270,7 @@ where
         }
     }; // TODO: parallelize if it's even helpful
 
-    let (a_inputs, a_aux, b_g1_inputs, b_g1_aux, b_g2_inputs, b_g2_aux, h, l) = match &backend {
+    let (a_inputs, a_aux, b_g2_inputs, b_g2_aux, h, l) = match &backend {
         Backend::Cpu => {
             let h_exps = h_scalars
                 .into_iter()
@@ -329,22 +329,6 @@ where
             let b_aux_density = Arc::new(prover.b_aux_density);
             let b_aux_density_total = b_aux_density.get_total_density();
 
-            let (b_g1_inputs_source, b_g1_aux_source) =
-                params.get_b_g1(b_input_density_total, b_aux_density_total)?;
-
-            let b_g1_inputs = multiexp(
-                &worker,
-                b_g1_inputs_source,
-                b_input_density.clone(),
-                input_assignment.clone(),
-            );
-            let b_g1_aux = multiexp(
-                &worker,
-                b_g1_aux_source,
-                b_aux_density.clone(),
-                aux_assignment.clone(),
-            );
-
             let (b_g2_inputs_source, b_g2_aux_source) =
                 params.get_b_g2(b_input_density_total, b_aux_density_total)?;
 
@@ -356,16 +340,7 @@ where
             );
             let b_g2_aux = multiexp(&worker, b_g2_aux_source, b_aux_density, aux_assignment);
 
-            (
-                a_inputs,
-                a_aux,
-                b_g1_inputs,
-                b_g1_aux,
-                b_g2_inputs,
-                b_g2_aux,
-                h,
-                l,
-            )
+            (a_inputs, a_aux, b_g2_inputs, b_g2_aux, h, l)
         }
         Backend::Gpu(devs) => {
             let devs = devs.lock().unwrap();
@@ -432,24 +407,6 @@ where
             let b_aux_density = Arc::new(prover.b_aux_density);
             let b_aux_density_total = b_aux_density.get_total_density();
 
-            let (b_g1_inputs_source, b_g1_aux_source) =
-                params.get_b_g1(b_input_density_total, b_aux_density_total)?;
-
-            let b_g1_inputs = multiexp_gpu::<_, _, E::G1, _, E>(
-                &worker,
-                b_g1_inputs_source,
-                b_input_density.clone(),
-                input_assignment.clone(),
-                &mut mx_kern,
-            );
-            let b_g1_aux = multiexp_gpu::<_, _, E::G1, _, E>(
-                &worker,
-                b_g1_aux_source,
-                b_aux_density.clone(),
-                aux_assignment.clone(),
-                &mut mx_kern,
-            );
-
             let (b_g2_inputs_source, b_g2_aux_source) =
                 params.get_b_g2(b_input_density_total, b_aux_density_total)?;
 
@@ -468,16 +425,7 @@ where
                 &mut mx_kern,
             );
 
-            (
-                a_inputs,
-                a_aux,
-                b_g1_inputs,
-                b_g1_aux,
-                b_g2_inputs,
-                b_g2_aux,
-                h,
-                l,
-            )
+            (a_inputs, a_aux, b_g2_inputs, b_g2_aux, h, l)
         }
     };
 
@@ -488,32 +436,16 @@ where
     }
 
     let mut g_a = vk.delta_g1 * r;
-    AddAssign::<&E::G1Affine>::add_assign(&mut g_a, &vk.alpha_g1);
     let mut g_b = vk.delta_g2 * s;
-    AddAssign::<&E::G2Affine>::add_assign(&mut g_b, &vk.beta_g2);
-    let mut g_c;
-    {
-        let mut rs = r;
-        rs.mul_assign(&s);
-
-        g_c = vk.delta_g1 * rs;
-        AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.alpha_g1 * s));
-        AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.beta_g1 * r));
-    }
+    let mut g_c = E::G1::identity();
     let mut a_answer = a_inputs.wait()?;
     AddAssign::<&E::G1>::add_assign(&mut a_answer, &a_aux.wait()?);
     AddAssign::<&E::G1>::add_assign(&mut g_a, &a_answer);
-    MulAssign::<E::Fr>::mul_assign(&mut a_answer, s);
-    AddAssign::<&E::G1>::add_assign(&mut g_c, &a_answer);
 
-    let mut b1_answer: E::G1 = b_g1_inputs.wait()?;
-    AddAssign::<&E::G1>::add_assign(&mut b1_answer, &b_g1_aux.wait()?);
     let mut b2_answer = b_g2_inputs.wait()?;
     AddAssign::<&E::G2>::add_assign(&mut b2_answer, &b_g2_aux.wait()?);
 
     AddAssign::<&E::G2>::add_assign(&mut g_b, &b2_answer);
-    MulAssign::<E::Fr>::mul_assign(&mut b1_answer, r);
-    AddAssign::<&E::G1>::add_assign(&mut g_c, &b1_answer);
     AddAssign::<&E::G1>::add_assign(&mut g_c, &h.wait()?);
     AddAssign::<&E::G1>::add_assign(&mut g_c, &l.wait()?);
 
