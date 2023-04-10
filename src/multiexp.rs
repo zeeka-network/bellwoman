@@ -177,8 +177,8 @@ pub enum Exponent<F: PrimeFieldBits> {
 impl<F: PrimeFieldBits> Exponent<F> {
     pub fn to_repr<P: PrimeField>(&self) -> P::Repr {
         match self {
-            Exponent::Zero => P::zero().to_repr(),
-            Exponent::One => P::one().to_repr(),
+            Exponent::Zero => P::ZERO.to_repr(),
+            Exponent::One => P::ONE.to_repr(),
             Exponent::Bits(bits) => {
                 let mut rep = P::Repr::default();
                 let mut i = 0;

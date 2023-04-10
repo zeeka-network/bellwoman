@@ -31,9 +31,9 @@ pub fn radix_fft<S: PrimeField>(
 
     // Precalculate:
     // [omega^(0/(2^(deg-1))), omega^(1/(2^(deg-1))), ..., omega^((2^(deg-1)-1)/(2^(deg-1)))]
-    let mut pq = vec![S::zero(); 1 << max_deg >> 1];
+    let mut pq = vec![S::ZERO; 1 << max_deg >> 1];
     let twiddle = omega.pow_vartime([(n >> max_deg) as u64]);
-    pq[0] = S::one();
+    pq[0] = S::ONE;
     if max_deg > 1 {
         pq[1] = twiddle;
         for i in 2..(1 << max_deg >> 1) {
@@ -44,7 +44,7 @@ pub fn radix_fft<S: PrimeField>(
     let pq_buffer = program.create_buffer_from_slice(&pq)?;
 
     // Precalculate [omega, omega^2, omega^4, omega^8, ..., omega^(2^31)]
-    let mut omegas = vec![S::zero(); 32];
+    let mut omegas = vec![S::ZERO; 32];
     omegas[0] = *omega;
     for i in 1..LOG2_MAX_ELEMENTS {
         omegas[i] = omegas[i - 1].pow_vartime([2u64]);
@@ -227,7 +227,7 @@ impl<E: Engine + GpuEngine> SingleFftKernel<E> {
             &self.program,
             &mut buffer,
             log_n,
-            &E::Fr::multiplicative_generator(),
+            &E::Fr::MULTIPLICATIVE_GENERATOR,
         )?;
         radix_fft::<E::Fr>(
             &self.program,
@@ -283,7 +283,7 @@ impl<E: Engine + GpuEngine> SingleFftKernel<E> {
             &self.program,
             &mut buffer,
             log_n,
-            &E::Fr::multiplicative_generator(),
+            &E::Fr::MULTIPLICATIVE_GENERATOR,
         )?;
         radix_fft::<E::Fr>(
             &self.program,

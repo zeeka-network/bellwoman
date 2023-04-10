@@ -162,6 +162,20 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
 pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
     circuit: C,
     params: P,
+    rng: &mut R,
+) -> Result<Proof<E>, SynthesisError>
+where
+    E: Engine + crate::gpu::GpuEngine,
+    E::Fr: PrimeFieldBits,
+    C: Circuit<E::Fr>,
+    R: RngCore,
+{
+    create_random_proof_with_backend::<E, C, R, P>(circuit, params, rng, Backend::Cpu, None)
+}
+
+pub fn create_random_proof_with_backend<E, C, R, P: ParameterSource<E>>(
+    circuit: C,
+    params: P,
     mut rng: &mut R,
     backend: Backend,
     cancel: Option<Arc<RwLock<bool>>>,

@@ -220,7 +220,7 @@ impl<S: PrimeField, G: Group<S>> EvaluationDomain<S, G> {
         kern: &mut crate::gpu::FftKernel<E>,
     ) -> crate::gpu::GpuResult<()> {
         use std::mem::transmute;
-        let divz = a.z(&E::Fr::multiplicative_generator()).invert().unwrap();
+        let divz = a.z(&E::Fr::MULTIPLICATIVE_GENERATOR).invert().unwrap();
 
         let a_coeffs = unsafe { transmute::<&mut [Scalar<E::Fr>], &mut [E::Fr]>(&mut a.coeffs) };
         let b_coeffs = unsafe { transmute::<&[Scalar<E::Fr>], &[E::Fr]>(&b.coeffs) };
